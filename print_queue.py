@@ -165,6 +165,13 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--copies", type=int, default=1, help="total number of queued copies")
     add.add_argument("--strict", action="store_true", help="disable auto-refill for this job")
     add.add_argument("--map", action="append", default=[], metavar="N=A1")
+    add.add_argument(
+        "--stage",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="postprocessing stage (default: 1; Stage 2 enables external actuators)",
+    )
 
     listing = commands.add_parser("list", help="show the queue")
     listing.add_argument("--all", action="store_true")
@@ -228,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise QueueError("--copies must be at least one")
             ids = add_to_queue(
                 store, home, args.file, name=args.name, strict=args.strict,
-                preferred=parse_mappings(args.map), copies=args.copies,
+                preferred=parse_mappings(args.map), copies=args.copies, stage=args.stage,
             )
             print("Queued job IDs: " + ", ".join(map(str, ids)))
         elif args.command == "list":

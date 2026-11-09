@@ -101,7 +101,7 @@ def _is_processed(path: Path) -> bool:
             return any(plate_cycle.CYCLE_TAG in line for line in source)
 
 
-def process_for_queue(source: Path, destination: Path) -> float:
+def process_for_queue(source: Path, destination: Path, *, stage: int = 1) -> float:
     if not zipfile.is_zipfile(source):
         raise QueueError("queue intake requires a sliced .gcode.3mf/.3mf archive")
     if _is_processed(source):
@@ -124,7 +124,9 @@ def process_for_queue(source: Path, destination: Path) -> float:
     buffer = io.StringIO()
     try:
         with redirect_stdout(buffer):
-            result = plate_cycle.main([str(source), "-o", str(destination), "--json"])
+            result = plate_cycle.main(
+                [str(source), "-o", str(destination), "--stage", str(stage), "--json"]
+            )
     except farmloop_timelapse.FarmLoopError as exc:
         raise QueueError(f"postprocessing failed: {exc}") from exc
     if result != 0:
@@ -146,6 +148,7 @@ def add_to_queue(
     strict: bool = False,
     preferred: dict[int, str] | None = None,
     copies: int = 1,
+    stage: int = 1,
 ) -> list[int]:
     source = source.expanduser().resolve()
     if not source.is_file():
@@ -153,7 +156,7 @@ def add_to_queue(
     artifact_id = uuid.uuid4().hex
     suffix = ".gcode.3mf" if source.name.lower().endswith(".gcode.3mf") else ".3mf"
     destination = home / "artifacts" / f"{artifact_id}{suffix}"
-    clear_height = process_for_queue(source, destination)
+    clear_height = process_for_queue(source, destination, stage=stage)
     try:
         requirements = read_requirements(destination)
         first = store.add_job(

@@ -18,6 +18,9 @@ def native_plate(max_z: float = 31.16) -> str:
 ; CONFIG_BLOCK_END
 ; EXECUTABLE_BLOCK_START
 G90
+;======== P2S start gcode==========
+;===== fixture =====
+M140 S70
 ;===== for Textured PEI Plate , lower the nozzle as the nozzle was touching topmost of the texture when homing ==
 G29.1 Z0.03
 ;===== nozzle load line ===============================
@@ -124,9 +127,12 @@ class PlateCycleTests(unittest.TestCase):
         stage1_text = stage1.read_text(encoding="utf-8")
         self.assertNotIn("G130 O0", stage1_text)
         self.assertIn("G1 E50 F200", stage1_text)
+        self.assertIn("G29.1 Z0.03", stage1_text)
+        self.assertNotIn("G29.1 Z+0.00", stage1_text)
         self.assertIn("G1 Z21.16 F10000", stage1_text)
         self.assertEqual(stage1_text.count("M190 S25 ; cooldown wait"), 2)
         self.assertIn("G1 Z20.2 F600 ; cycle-ready Z park", stage1_text)
+        self.assertNotRegex(stage1_text, r"(?m)^\s*M18(?:\s|;|$)")
 
         scan = timelapse.scan_gcode(stage1)
         self.assertEqual(scan.physical_layers, 2)
@@ -142,6 +148,52 @@ class PlateCycleTests(unittest.TestCase):
         self.assertEqual(validation.generated_snapshots, 44)
         self.assertEqual(validation.original_snapshots, 2)
         self.assertEqual(validation.active_finish_commands, 1)
+
+    def test_stage2_is_opt_in_and_uses_external_actuators(self) -> None:
+        source = self.root / "plate.gcode"
+        stage2 = self.root / "stage2.gcode"
+        output = self.root / "output.gcode"
+        source.write_text(native_plate(), encoding="utf-8")
+
+        native = cycle.scan_native_gcode(source)
+        config = cycle.CycleConfig(
+            clear_height=cycle.default_clear_height(native.max_z_height),
+            stage=2,
+            cooldown_waits=2,
+        )
+        cycle.transform_native_gcode(source, stage2, native, config)
+        cycle.validate_cycle_markers(stage2)
+
+        stage2_text = stage2.read_text(encoding="utf-8")
+        self.assertIn("G29.1 Z0.03", stage2_text)
+        self.assertIn("M104 S1 ; Stage 2 RESET sentinel", stage2_text)
+        self.assertIn("M104 S2 ; Stage 2 T1 sentinel", stage2_text)
+        self.assertIn("M104 S3 ; Stage 2 T2 sentinel", stage2_text)
+        self.assertIn("M104 S4 ; Stage 2 safety sentinel", stage2_text)
+        self.assertIn("M104 S5 ; Stage 2 T3 sentinel", stage2_text)
+        self.assertIn("; EXTERNAL BENDING", stage2_text)
+        self.assertNotIn("bend-up stroke", stage2_text)
+        self.assertNotIn("cycle-ready Z park", stage2_text)
+        self.assertNotRegex(stage2_text, r"(?m)^\s*M18(?:\s|;|$)")
+        self.assertLess(stage2_text.index("G28\nM104 S1"), stage2_text.index("M140 S70"))
+
+        scan = timelapse.scan_gcode(stage2)
+        self.assertEqual(scan.physical_layers, 2)
+        self.assertEqual(scan.bend_operations, 0)
+        self.assertEqual(scan.clearing_passes, 16)
+        self.assertEqual(scan.synthetic_layers, 32)
+
+        timelapse.transform_gcode(stage2, output, scan)
+        validation = timelapse.validate_patched(output, expected=scan)
+        self.assertEqual(validation.logical_layers, 34)
+        self.assertEqual(validation.generated_snapshots, 32)
+        self.assertNotRegex(
+            output.read_text(encoding="utf-8"), r"(?m)^\s*M18(?:\s|;|$)"
+        )
+
+    def test_stage1_remains_the_default(self) -> None:
+        self.assertEqual(cycle.CycleConfig(clear_height=20).stage, 1)
+        self.assertEqual(cycle.build_parser().parse_args(["input.gcode"]).stage, 1)
 
     def test_rejects_already_processed_input(self) -> None:
         source = self.root / "plate.gcode"

@@ -78,6 +78,6 @@ def recovery_sweep_gcode(clear_height: float, *, drop_mm: float, attempt: int, p
     for x in (220, 190, 160, 130, 100, 70, 30):
         lines.extend(["G1 Y250 F12000", f"G1 X{x} F12000", "G1 Y0 F12000"])
     lines.extend(
-        ["G1 X65 Y245 F12000", "G1 Y265 F3000", f"G1 Z{park_z:g} F600", "M400", "M18"]
+        ["G1 X65 Y245 F12000", "G1 Y265 F3000", f"G1 Z{park_z:g} F600", "M400"]
     )
     return height, "\n".join(lines) + "\n"

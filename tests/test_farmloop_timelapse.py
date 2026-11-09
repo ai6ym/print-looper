@@ -125,6 +125,18 @@ class ProcessorTests(unittest.TestCase):
         result = fl.validate_patched(output, expected=scan)
         self.assertEqual(result.generated_snapshots, 10)
 
+    def test_explicit_external_bending_allows_sweep_only_routine(self) -> None:
+        text = section(1).replace(
+            "; BENDING MOTION\nG1 Z231 F12000 ; bend-up stroke #1\n"
+            "G1 Z199 F12000 ; bend-down stroke #1",
+            "; EXTERNAL BENDING",
+        )
+        scan, output = self.run_transform(text)
+        self.assertEqual(scan.bend_operations, 0)
+        self.assertEqual(scan.clearing_passes, 1)
+        self.assertEqual(scan.synthetic_layers, 2)
+        self.assertEqual(fl.validate_patched(output, expected=scan).generated_snapshots, 2)
+
     def test_rejects_mismatched_layer_pair(self) -> None:
         source = self.root / "bad.gcode"
         source.write_text(section(1).replace("M991 S0 P0", "M991 S0 P8"), encoding="utf-8")

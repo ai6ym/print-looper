@@ -34,6 +34,9 @@ MAX_Z_RE = re.compile(
 )
 M109_RE = re.compile(r"^\s*M109\s+S\s*(-?(?:\d+(?:\.\d*)?|\.\d+))(?=\s|;|$)", re.I)
 G1_Z_RE = re.compile(r"^\s*G1\s+Z\s*(-?(?:\d+(?:\.\d*)?|\.\d+))(?=\s|;|$)", re.I)
+G29_1_RE = re.compile(r"^\s*G29\.1\b", re.I)
+M18_RE = re.compile(r"^\s*M18(?:\s|;|$)", re.I)
+P2S_START_TEXT = ";======== P2S start gcode=========="
 
 
 class CycleError(timelapse.FarmLoopError):
@@ -43,6 +46,7 @@ class CycleError(timelapse.FarmLoopError):
 @dataclass(frozen=True)
 class CycleConfig:
     clear_height: float
+    stage: int = 1
     cooldown_temperature: float = 25.0
     cooldown_waits: int = 60
     bend_cycles: int = 6
@@ -60,6 +64,8 @@ class NativeScan:
     newline: str
     setup_start_line: int
     setup_end_line: int
+    bed_compensation_line: str
+    stage2_start_before_line: int | None
     cycle_replace_start_line: int
     cycle_replace_end_line: int
     finish_z_lines: tuple[int, int]
@@ -75,6 +81,7 @@ class CycleReport:
     archive_member: str | None
     max_z_height: float
     clear_height: float
+    stage: int
     cooldown_temperature: float
     cooldown_waits: int
     bend_operations: int
@@ -111,7 +118,10 @@ def scan_native_gcode(path: Path) -> NativeScan:
     max_z_values: list[float] = []
     setup_starts: list[int] = []
     setup_ends: list[int] = []
+    bed_compensation_lines: list[str] = []
     nozzle_temperatures: list[float] = []
+    p2s_start_seen = False
+    stage2_start_before_line: int | None = None
     machine_end_lines: list[int] = []
     pullback_line = 0
     post_pullback_g150 = 0
@@ -146,12 +156,21 @@ def scan_native_gcode(path: Path) -> NativeScan:
                 setup_starts.append(line_number)
                 in_setup = True
             if in_setup:
+                if G29_1_RE.match(body):
+                    bed_compensation_lines.append(body)
                 temperature = M109_RE.match(body)
                 if temperature:
                     nozzle_temperatures.append(float(temperature.group(1)))
             if stripped.startswith(SETUP_END_TEXT):
                 setup_ends.append(line_number)
                 in_setup = False
+
+            if stripped == P2S_START_TEXT:
+                p2s_start_seen = True
+            elif p2s_start_seen and stage2_start_before_line is None and re.match(
+                r"^M140\s+S", stripped, re.I
+            ):
+                stage2_start_before_line = line_number
 
             if stripped == MACHINE_END_TEXT:
                 machine_end_lines.append(line_number)
@@ -197,6 +216,11 @@ def scan_native_gcode(path: Path) -> NativeScan:
         raise CycleError(
             f"expected one resolved M109 temperature in the nozzle-load section, found {len(nozzle_temperatures)}"
         )
+    if len(bed_compensation_lines) != 1:
+        raise CycleError(
+            "expected one resolved G29.1 command in the native nozzle-load section, "
+            f"found {len(bed_compensation_lines)}"
+        )
     _require_one("MACHINE_END_GCODE_START", machine_end_lines)
     cycle_start = _require_one("post-unload M104 S0", cycle_starts)
     cycle_end = _require_one("post-unload motion wait", cycle_ends)
@@ -218,6 +242,8 @@ def scan_native_gcode(path: Path) -> NativeScan:
         newline=first_ending or "\n",
         setup_start_line=setup_start,
         setup_end_line=setup_end,
+        bed_compensation_line=bed_compensation_lines[0],
+        stage2_start_before_line=stage2_start_before_line,
         cycle_replace_start_line=cycle_start,
         cycle_replace_end_line=cycle_end,
         finish_z_lines=(finish_z_lines[0], finish_z_lines[1]),
@@ -235,11 +261,12 @@ def setup_block(scan: NativeScan, config: CycleConfig) -> list[str]:
     temp = format_number(scan.nozzle_load_temperature)
     prime = format_number(config.prime_length)
     feed = format_number(config.prime_feedrate)
-    return _lines(
+    lines = _lines(
         f"""; {CYCLE_TAG}_SETUP_BEGIN
+; {CYCLE_TAG}_STAGE_{config.stage}
 ; @fl:section:start "cleaning.p2s.nozzle-load-line"
 ; Prime away from the build plate so teardown sweeps do not encounter a load line.
-G29.1 Z+0.00 ; FarmLoop P2S cycle profile
+__PRESERVE_G29_1__
 M109 S{temp}
 M975 S1
 G90
@@ -254,38 +281,47 @@ M400
 ; {CYCLE_TAG}_SETUP_END""",
         scan.newline,
     )
+    marker = "__PRESERVE_G29_1__" + scan.newline
+    return [scan.bed_compensation_line + scan.newline if line == marker else line for line in lines]
 
 
-def cycle_block(scan: NativeScan, config: CycleConfig) -> list[str]:
-    cool = format_number(config.cooldown_temperature)
-    clear = format_number(config.clear_height)
-    up = format_number(config.bend_up_z)
-    down = format_number(config.bend_down_z)
-    block: list[str] = [
-        f"; {CYCLE_TAG}_TEARDOWN_BEGIN",
-        "M104 S0 ; turn off hotend",
-        "M140 S0 ; turn off bed",
-        "M400 ; wait for queued print motion",
-        "M145 P0 ; put the P2S air duct in cooling mode",
-        "M106 P2 S255 ; auxiliary cooling fan",
-        "M106 P3 S255 ; chamber exhaust fan",
-        f"; Cool bed to {cool} C before flexing",
-    ]
-    block.extend(
-        f"M190 S{cool} ; cooldown wait {number}/{config.cooldown_waits}"
-        for number in range(1, config.cooldown_waits + 1)
+def stage2_start_block(scan: NativeScan) -> list[str]:
+    return _lines(
+        f"""; {CYCLE_TAG}_STAGE_2_START_BEGIN
+G28
+M104 S1 ; Stage 2 RESET sentinel: arm MQTT auto-trigger
+; RESET: four quick actuator-switch taps
+G1 Z255 F6000
+G4 P150
+G1 Z243 F3000
+G4 P250
+G1 Z255 F3000
+G4 P150
+G1 Z243 F3000
+G4 P250
+G1 Z255 F3000
+G4 P150
+G1 Z243 F3000
+G4 P250
+G1 Z255 F3000
+G4 P150
+G1 Z243 F3000
+G4 P1000 ; wait for reset sequence
+; TRIGGER 0: long tap followed by short tap
+G1 Z255 F3000
+M400
+G4 P3500
+G1 Z243 F3000
+G4 P500
+G1 Z255 F3000
+G4 P200
+G1 Z20 F3000
+; {CYCLE_TAG}_STAGE_2_START_END""",
+        scan.newline,
     )
-    block.extend(
-        [
-            timelapse.CLEAR_START,
-            "M140 S0 ; keep bed heater off",
-            "M104 S0 ; keep hotend off",
-            "; BENDING MOTION",
-        ]
-    )
-    for number in range(1, config.bend_cycles + 1):
-        block.append(f"G1 Z{up} F12000 ; bend-up stroke #{number}")
-        block.append(f"G1 Z{down} F12000 ; bend-down stroke #{number}")
+
+
+def append_sweep(block: list[str], clear: str) -> None:
     block.extend(
         [
             "; PUSH SECTION",
@@ -322,16 +358,135 @@ def cycle_block(scan: NativeScan, config: CycleConfig) -> list[str]:
             "; END SECTION",
             "G1 X65 Y245 F12000 ; safe corner before parking",
             "G1 Y265 F3000 ; rear idle position",
-            timelapse.CLEAR_END,
-            "M106 S0 ; part cooling fan off",
-            "M106 P2 S0 ; auxiliary fan off",
-            "M106 P3 S0 ; chamber exhaust fan off",
-            '; @fl:section:start "fan.off.left-aux"',
-            "M106 P10 S0 ; left auxiliary fan off",
-            '; @fl:section:end "fan.off.left-aux"',
-            f"; {CYCLE_TAG}_TEARDOWN_END",
         ]
     )
+
+
+def cycle_block(scan: NativeScan, config: CycleConfig) -> list[str]:
+    cool = format_number(config.cooldown_temperature)
+    clear = format_number(config.clear_height)
+    block: list[str] = [
+        f"; {CYCLE_TAG}_TEARDOWN_BEGIN",
+        "M104 S0 ; turn off hotend",
+        "M140 S0 ; turn off bed",
+        "M400 ; wait for queued print motion",
+        "M145 P0 ; put the P2S air duct in cooling mode",
+        "M106 P2 S255 ; auxiliary cooling fan",
+        "M106 P3 S255 ; chamber exhaust fan",
+    ]
+
+    if config.stage == 2:
+        block.extend(
+            [
+                "M104 S2 ; Stage 2 T1 sentinel: print done, open door and start fan",
+                "; TRIGGER 1: five-second actuator-switch press",
+                "G1 Z243 F3000",
+                "M400",
+                "G1 Z255 F3000",
+                "M400",
+                "G4 S5",
+                "M400",
+                "G1 Z243 F3000",
+            ]
+        )
+
+    block.append(f"; Cool bed to {cool} C before clearing")
+    block.extend(
+        f"M190 S{cool} ; cooldown wait {number}/{config.cooldown_waits}"
+        for number in range(1, config.cooldown_waits + 1)
+    )
+    block.extend([timelapse.CLEAR_START, "M140 S0 ; keep bed heater off", "M104 S0 ; keep hotend off"])
+
+    if config.stage == 1:
+        up = format_number(config.bend_up_z)
+        down = format_number(config.bend_down_z)
+        block.append("; BENDING MOTION")
+        for number in range(1, config.bend_cycles + 1):
+            block.append(f"G1 Z{up} F12000 ; bend-up stroke #{number}")
+            block.append(f"G1 Z{down} F12000 ; bend-down stroke #{number}")
+    else:
+        block.extend(
+            [
+                "; EXTERNAL BENDING",
+                "M104 S3 ; Stage 2 T2 sentinel: cooldown complete, start bending",
+                "; TRIGGER 2: triple tap",
+                "G4 P500",
+                "G1 Z255 F1000",
+                "G4 P150",
+                "G1 Z243 F3000",
+                "G4 P300",
+                "G1 Z255 F1000",
+                "G4 P150",
+                "G1 Z243 F3000",
+                "G4 P300",
+                "G1 Z255 F1000",
+                "G4 P150",
+                "G1 Z243 F3000",
+                "G4 P6000 ; wait for actuator count window",
+                "G4 P85000 ; wait for external bending",
+            ]
+        )
+
+    append_sweep(block, clear)
+
+    if config.stage == 2:
+        block.extend(
+            [
+                "M104 S4 ; Stage 2 safety sentinel: clearing done",
+                "; SAFETY TRIGGER: double tap",
+                "G1 Z243 F3000",
+                "M400",
+                "G1 Z255 F1000",
+                "G4 P150",
+                "G1 Z243 F3000",
+                "G4 P300",
+                "G1 Z255 F1000",
+                "G4 S5",
+                "G1 Z243 F3000",
+                "G4 P20000 ; wait for safety check",
+                "M104 S5 ; Stage 2 T3 sentinel: close door",
+            ]
+        )
+
+    block.append(timelapse.CLEAR_END)
+
+    if config.stage == 2:
+        block.extend(
+            [
+                "; TRIGGER 3: five-second final door-close press",
+                "G1 Z255 F3000",
+                "M400",
+                "G4 S5",
+                "M400",
+                "G1 Z220 F3000",
+                "M106 S0 ; part cooling fan off",
+                "M106 P2 S0 ; auxiliary fan off",
+                "M106 P3 S0 ; chamber exhaust fan off",
+                "M400 ; wait all motion done",
+                "M17 S",
+                "M17 Z0.4 ; lower Z motor current",
+                "M400 P100",
+                "M17 R ; restore Z current",
+                "M220 S100 ; reset feedrate magnitude",
+                "M201.2 K1.0 ; reset acceleration magnitude",
+                "M73.2 R1.0 ; reset remaining-time magnitude",
+                "M1002 set_gcode_claim_speed_level : 0",
+                "M17 X0.8 Y0.8 Z0.5 ; keep motors enabled at reduced current",
+            ]
+        )
+    else:
+        block.extend(
+            [
+                "M106 S0 ; part cooling fan off",
+                "M106 P2 S0 ; auxiliary fan off",
+                "M106 P3 S0 ; chamber exhaust fan off",
+                '; @fl:section:start "fan.off.left-aux"',
+                "M106 P10 S0 ; left auxiliary fan off",
+                '; @fl:section:end "fan.off.left-aux"',
+            ]
+        )
+
+    block.append(f"; {CYCLE_TAG}_TEARDOWN_END")
     return [line + scan.newline for line in block]
 
 
@@ -341,14 +496,18 @@ def transform_native_gcode(
     scan: NativeScan,
     config: CycleConfig,
 ) -> None:
+    if config.stage not in {1, 2}:
+        raise CycleError("--stage must be 1 or 2")
     if config.cooldown_waits < 1:
         raise CycleError("--cooldown-waits must be at least 1")
-    if config.bend_cycles < 1:
+    if config.stage == 1 and config.bend_cycles < 1:
         raise CycleError("--bend-cycles must be at least 1")
     if not 0 < config.clear_height < config.bend_down_z:
         raise CycleError(
             f"clear height must be above 0 and below bend-down Z {config.bend_down_z:g}"
         )
+    if config.stage == 2 and scan.stage2_start_before_line is None:
+        raise CycleError("Stage 2 requires an unambiguous P2S start-gcode bed-heating anchor")
 
     skip_through = 0
     with source.open("r", encoding="utf-8", newline="") as src, destination.open(
@@ -360,25 +519,33 @@ def transform_native_gcode(
             body, ending = timelapse.split_line_ending(raw)
             nl = ending or scan.newline
 
+            if config.stage == 2 and line_number == scan.stage2_start_before_line:
+                dst.writelines(stage2_start_block(scan))
             if line_number == scan.setup_start_line:
                 dst.writelines(setup_block(scan, config))
                 skip_through = scan.setup_end_line
                 continue
             if line_number == scan.cycle_replace_start_line:
                 dst.writelines(cycle_block(scan, config))
-                skip_through = scan.cycle_replace_end_line
+                skip_through = (
+                    scan.final_progress_line - 1
+                    if config.stage == 2
+                    else scan.cycle_replace_end_line
+                )
                 continue
-            if line_number == scan.finish_z_lines[0]:
+            if config.stage == 1 and line_number == scan.finish_z_lines[0]:
                 dst.write(f"G1 Z{format_number(config.park_z)} F600 ; cycle-ready Z park" + nl)
                 continue
-            if line_number == scan.finish_z_lines[1]:
+            if config.stage == 1 and line_number == scan.finish_z_lines[1]:
                 dst.write(f"G1 Z{format_number(config.park_z)} ; hold cycle-ready Z park" + nl)
                 continue
-            if line_number == scan.speed_reset_before_line:
+            if config.stage == 1 and line_number == scan.speed_reset_before_line:
                 dst.write("M1002 set_gcode_claim_speed_level : 0" + nl)
             if line_number == scan.final_progress_line:
                 dst.write("M104 S0 ; final hotend-off guard" + nl)
                 dst.write("M140 S0 ; final bed-off guard" + nl)
+            if M18_RE.match(body):
+                continue
             dst.write(raw)
 
 
@@ -433,6 +600,7 @@ def build_report(
         archive_member=member,
         max_z_height=native.max_z_height,
         clear_height=config.clear_height,
+        stage=config.stage,
         cooldown_temperature=config.cooldown_temperature,
         cooldown_waits=config.cooldown_waits,
         bend_operations=stage1_scan.bend_operations,
@@ -444,7 +612,7 @@ def build_report(
         generated_snapshots=validation.generated_snapshots,
         validation="passed",
         warnings=[
-            "P2S flex/sweep motion and synthetic timelapse layers must be supervised on the first hardware run.",
+            "P2S clearing motion and synthetic timelapse layers must be supervised on the first hardware run.",
             "The automatic clear height is max(max_z_height minus 10 mm, 5 mm); override it if that does not contact this part safely.",
         ],
     )
@@ -460,6 +628,7 @@ def print_report(report: CycleReport, *, json_output: bool) -> None:
     if report.output:
         print(f"Output: {report.output}")
     print(f"Model max Z: {report.max_z_height:g} mm")
+    print(f"Processing stage: {report.stage}")
     print(f"Clearing height: {report.clear_height:g} mm")
     print(
         f"Cooldown: {report.cooldown_temperature:g} C "
@@ -516,6 +685,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="sweep Z height in mm (default: max(max_z_height minus 10 mm, 5 mm))",
     )
+    parser.add_argument(
+        "--stage",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="postprocessing stage (default: 1; Stage 2 enables external actuators)",
+    )
     parser.add_argument("--cooldown-temperature", type=float, default=25.0, help="bed cooldown target")
     parser.add_argument("--cooldown-waits", type=int, default=60, help="repeated M190 waits")
     parser.add_argument("--bend-cycles", type=int, default=6, help="P2S bed flex cycles")
@@ -549,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         config = CycleConfig(
             clear_height=clear_height,
+            stage=args.stage,
             cooldown_temperature=args.cooldown_temperature,
             cooldown_waits=args.cooldown_waits,
             bend_cycles=args.bend_cycles,

@@ -11,6 +11,7 @@ class PlateVerifierTests(unittest.TestCase):
         self.assertEqual(height, 15.0)
         self.assertIn("G1 Z15 F10000", gcode)
         self.assertEqual(gcode.count("G1 Y0"), 16)
+        self.assertNotIn("M18", gcode)
         floor, _ = recovery_sweep_gcode(8.0, drop_mm=3.0, attempt=4)
         self.assertEqual(floor, 5.0)
 

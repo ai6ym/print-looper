@@ -200,10 +200,12 @@ independently queueable print job. It applies the useful FarmLoop-style setup
 and teardown changes without concatenating multiple prints:
 
 - replaces the on-bed nozzle load line with a non-bed prime;
+- preserves the sliced file's resolved `G29.1` bed-compensation command;
 - cools the bed before part removal;
 - performs six P2S flex cycles;
 - performs 16 slow/fast forward clearing passes;
-- parks the printer in a clean, heaters-off state for the next queue item; and
+- parks the printer in a clean, heaters-off, motors-enabled state for the next
+  queue item or recovery clearing pass; and
 - runs the timelapse correction pass described below, including synthetic
   teardown frames, continuous layer numbering, and one final timelapse close.
 
@@ -221,6 +223,7 @@ geometry.
 
 ```sh
 python3 plate_cycle.py sliced-plate.gcode.3mf -o queued-job.gcode.3mf
+python3 plate_cycle.py sliced-plate.gcode.3mf -o stage2.gcode.3mf --stage 2
 python3 plate_cycle.py sliced-plate.gcode.3mf --dry-run
 python3 plate_cycle.py queued-job.gcode.3mf --validate
 ```
@@ -229,6 +232,12 @@ Add `--json` for a machine-readable report. Other cycle settings can be
 inspected with `python3 plate_cycle.py --help`. Inputs and existing outputs are
 never overwritten. For 3MF inputs, all non-G-code members and ZIP metadata are
 preserved and the G-code MD5 sidecar is recomputed.
+
+Stage 1 is the default. `--stage 2` opts into the external-actuator sequence:
+startup reset/arm, MQTT temperature sentinels, physical switch taps for the
+door/fan/bender controller, external bending waits, the normal clearing sweep,
+and the final safety/door-close triggers. Queue intake exposes the same choice
+as `print_queue.py add ... --stage 2`; omitting it keeps Stage 1.
 
 The processor recognizes resolved BambuStudio P2S start/end structures and
 fails closed if required anchors are missing, duplicated, or out of order. It

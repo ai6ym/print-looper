@@ -60,6 +60,7 @@ class ClearRoutine:
     bend_operations: int = 0
     clearing_passes: int = 0
     saw_bending_marker: bool = False
+    external_bending: bool = False
     saw_push_marker: bool = False
 
 
@@ -256,9 +257,11 @@ def scan_gcode(path: Path, *, allow_patched: bool = False) -> ScanResult:
                         raise FarmLoopError(
                             f"lines {routine.start_line}-{line_number}: clear routine lacks BENDING MOTION or PUSH SECTION marker"
                         )
-                    if not routine.bend_operations or not routine.clearing_passes:
+                    if not routine.clearing_passes or (
+                        not routine.bend_operations and not routine.external_bending
+                    ):
                         raise FarmLoopError(
-                            f"lines {routine.start_line}-{line_number}: no unambiguous bend pair or forward clearing pass"
+                            f"lines {routine.start_line}-{line_number}: no unambiguous internal/external bend or forward clearing pass"
                         )
                     result.clear_routines.append(routine)
                     in_clear = in_bending = in_push = in_sweep = False
@@ -268,6 +271,12 @@ def scan_gcode(path: Path, *, allow_patched: bool = False) -> ScanResult:
                     if "BENDING MOTION" in upper:
                         routine.saw_bending_marker = True
                         in_bending = True
+                        in_push = in_sweep = False
+                        sweep_positioned = False
+                    elif "EXTERNAL BENDING" in upper:
+                        routine.saw_bending_marker = True
+                        routine.external_bending = True
+                        in_bending = False
                         in_push = in_sweep = False
                         sweep_positioned = False
                     elif "PUSH SECTION" in upper:
