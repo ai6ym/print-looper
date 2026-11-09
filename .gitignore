@@ -1,0 +1,13 @@
+.print-looper/
+.venv/
+__pycache__/
+tests/__pycache__/
+*.pyc
+.DS_Store
+
+# Sliced/processed print artifacts may contain personal production files.
+*.gcode
+*.3mf
+
+# Personal operational skill contains machine-specific paths and host details.
+/skills/print-looper-ops/

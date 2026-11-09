@@ -1,0 +1,15 @@
+[Unit]
+Description=Print Looper LAN queue manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/justin/print-looper
+ExecStart=/home/justin/print-looper/.venv/bin/python /home/justin/print-looper/print_queue.py --home /home/justin/.local/state/print-looper run
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
